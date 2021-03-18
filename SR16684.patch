@@ -1,0 +1,330 @@
+From 074d057f4381855d54e2276b4ae74df4e2ccf583 Mon Sep 17 00:00:00 2001
+From: saishravan <saishravan.reddy@gmail.com>
+Date: Fri, 12 Jun 2020 10:21:14 +0530
+Subject: [PATCH] Context Saving and Restoring code added
+
+Signed-off-by: saishravan <saishravan.reddy@gmail.com>
+---
+ Makefile                               |   2 +-
+ arch/x86/entry/syscalls/syscall_64.tbl |   1 +
+ include/linux/mm_types.h               |   9 ++
+ include/linux/syscalls.h               |   2 +
+ kernel/fork.c                          |  23 +++++
+ mm/memory.c                            |  50 ++++++++-
+ my_precious/Makefile                   |   1 +
+ my_precious/my_precious.c              | 137 +++++++++++++++++++++++++
+ 8 files changed, 223 insertions(+), 2 deletions(-)
+ create mode 100644 my_precious/Makefile
+ create mode 100644 my_precious/my_precious.c
+
+diff --git a/Makefile b/Makefile
+index d5713e7b1..a43cf907c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -958,7 +958,7 @@ endif
+ PHONY += prepare0
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/
++core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/ my_precious/
+ 
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, $(init-y) $(init-m) \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index f0b1709a5..b3b7abc30 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -386,3 +386,4 @@
+ 545	x32	execveat		__x32_compat_sys_execveat/ptregs
+ 546	x32	preadv2			__x32_compat_sys_preadv64v2
+ 547	x32	pwritev2		__x32_compat_sys_pwritev64v2
++548	64	my_precious		__x64_sys_my_precious
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 2c471a2c4..e03bc666d 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -260,6 +260,13 @@ struct vm_userfaultfd_ctx {
+ struct vm_userfaultfd_ctx {};
+ #endif /* CONFIG_USERFAULTFD */
+ 
++struct save_context {
++	void *kvm_start;
++	void *uvm_start;
++	struct save_context *next_copied_page;
++};
++
++
+ /*
+  * This struct defines a memory VMM memory area. There is one of these
+  * per VM-area/task.  A VM area is any part of the process virtual memory
+@@ -345,6 +352,8 @@ struct kioctx_table;
+ struct mm_struct {
+ 	struct {
+ 		struct vm_area_struct *mmap;		/* list of VMAs */
++		struct save_context * program_state;
++		int context_saved_status;		//sravan
+ 		struct rb_root mm_rb;
+ 		u64 vmacache_seqnum;                   /* per-thread vmacache */
+ #ifdef CONFIG_MMU
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 257cccba3..a732abdc3 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1314,5 +1314,7 @@ static inline unsigned int ksys_personality(unsigned int personality)
+ 
+ 	return old;
+ }
++asmlinkage long sys_my_precious(int);
++
+ 
+ #endif
+diff --git a/kernel/fork.c b/kernel/fork.c
+index b69248e6f..999ba9d53 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -666,6 +666,29 @@ static void check_mm(struct mm_struct *mm)
+  */
+ void __mmdrop(struct mm_struct *mm)
+ {
++	//Context save memory flushing start here
++	//struct mm_struct *mm;
++	struct save_context *program_state;
++	struct save_context *temp;
++	void *buff;	
++	program_state = mm->program_state;
++	if (program_state ==NULL){
++		//printk("Program state flushed already\n");
++	}
++	else{
++		for (program_state = mm->program_state; program_state ; /*program_state = program_state->next_copied_page*/){			
++			buff = program_state->kvm_start;			
++			//freeing virtual addresses of buff
++			vfree(buff);
++			//printk("Flushed one kernel space saved context page successfully \n");
++			temp = program_state->next_copied_page;
++			vfree(program_state);
++			program_state = temp ;
++		}
++	}		
++	//Context saved memory flushing end here	
++
++	
+ 	BUG_ON(mm == &init_mm);
+ 	WARN_ON_ONCE(mm == current->mm);
+ 	WARN_ON_ONCE(mm == current->active_mm);
+diff --git a/mm/memory.c b/mm/memory.c
+index e11ca9dd8..5219b333b 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3798,9 +3798,57 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 	entry = vmf->orig_pte;
+ 	if (unlikely(!pte_same(*vmf->pte, entry)))
+ 		goto unlock;
++	//printk("reached here\n");
+ 	if (vmf->flags & FAULT_FLAG_WRITE) {
+-		if (!pte_write(entry))
++		//printk("write fault\n");
++		if (!pte_write(entry)) {
++			//printk("no write access\n");
++			//change done from here -sravan
++			struct task_struct *task = current;
++			struct mm_struct *mm;
++			mm = task->mm;
++			if (mm->context_saved_status == 1){
++				void *buff;
++				unsigned long save_status;
++				//printk("Copying started on write of one page at 0x%lx \n",vmf->address);
++				//Creating kernel buffer for storage of faulted page into kernel space				
++				buff = vmalloc(PAGE_SIZE);
++				//printk("Buffer created at 0x%lx \n",buff);
++				//Copying from user space address pointed by pte to kernel space buff
++				save_status = copy_from_user(buff,(const void *)(vmf->address),PAGE_SIZE);
++				//printk("Copied to buffer\n");
++				//Storing the details of the copied userspace page starting adress and kernel space buff address in dummy program_state
++				struct save_context *program_state;
++				program_state = (struct save_context *)vmalloc(sizeof(struct save_context));
++				program_state->kvm_start = buff;
++				program_state->uvm_start = vmf->address; //change page table entry to user space address appropriately
++				program_state->next_copied_page = NULL;
++				//printk("Dummy program_state created\n");
++				//Adding the dummy program_state to the last of the linked list pointed by mm->program_state
++				struct save_context *moving_program_state;
++				moving_program_state = mm->program_state;
++				if (mm->program_state==NULL){
++					mm->program_state = program_state;
++				}
++				else{
++					while (moving_program_state->next_copied_page!=NULL){
++						moving_program_state = moving_program_state->next_copied_page;	
++					}
++					moving_program_state->next_copied_page = program_state;
++				}
++
++				//printk("Copying done on write of one page at 0x%lx \n",vmf->address);
++				
++				//entry = pte_mkdirty(entry);
++				//entry = pte_mkyoung(entry);
++				pte_mkwrite(entry);
++				//return 1;
++			}
++			//upto here
++			//else{
+ 			return do_wp_page(vmf);
++			//}
++		}
+ 		entry = pte_mkdirty(entry);
+ 	}
+ 	entry = pte_mkyoung(entry);
+diff --git a/my_precious/Makefile b/my_precious/Makefile
+new file mode 100644
+index 000000000..04b8a0ffa
+--- /dev/null
++++ b/my_precious/Makefile
+@@ -0,0 +1 @@
++obj-y := my_precious.o
+diff --git a/my_precious/my_precious.c b/my_precious/my_precious.c
+new file mode 100644
+index 000000000..da8dd0cc2
+--- /dev/null
++++ b/my_precious/my_precious.c
+@@ -0,0 +1,137 @@
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/uaccess.h>
++#include <linux/sched.h>
++#include <linux/mm_types.h>
++#include <linux/mm.h>
++#include <linux/syscalls.h>
++
++void *buff;
++void *user_page;
++struct task_struct *task;
++struct mm_struct *mm;
++struct vm_area_struct *vma;
++struct save_context *program_state;
++unsigned long addr;
++pgd_t *pgd;
++p4d_t *p4d;
++pud_t *pud;
++pmd_t *pmd;
++pte_t *pte;
++
++
++static int save_context(struct mm_struct * mm)
++{
++        int count;
++	int i;
++        count = 0;
++	i=1;
++	mm = task->mm;
++        //printk("\nThis mm_struct has %d vmas.\n", mm->map_count);
++
++	//spin_lock(&mm->page_table_lock);
++	for (vma = mm->mmap ; vma ; vma = vma->vm_next) {   //loop for all vmas	  vma->vm_flags, (int) vma->vm_flags & VM_WRITE);  
++		/*                
++		printk ("\nVma number %d: \n", ++count);
++                printk("  Starts at 0x%lx, Ends at 0x%lx\n",vma->vm_start, vma->vm_end);
++		if (vma_is_anonymous(vma))
++		{
++			printk("This vma is anonymous \n");
++		}
++		*/
++		if (vma_is_anonymous(vma) && (vma->vm_end<=mm->mmap_base)){
++			addr = vma->vm_start;
++			//vma->vm_flags &= ~VM_WRITE;
++			//vma->vm_flags &= VM_MAYWRITE;
++			while(addr < vma->vm_end){ //loop for each page
++				//printk(" page protection started at address 0x%lx , page size= %lx", addr,PAGE_SIZE);
++				pgd = pgd_offset(mm, addr);
++				if (pgd_none(*pgd)) { addr += PAGE_SIZE; /*printk("not mapped in pgd\n"); */ continue; }       
++				p4d = p4d_offset(pgd, addr);
++				if (p4d_none(*p4d)) { addr += PAGE_SIZE; /*printk("not mapped in p4d\n"); */ continue; }
++				pud = pud_offset(p4d, addr);
++				if (pud_none(*pud)) { addr += PAGE_SIZE; /*printk("not mapped in pud\n"); */ continue; }
++				pmd = pmd_offset(pud, addr);
++				if (pmd_none(*pmd)) { addr += PAGE_SIZE; /*printk("not mapped in pmd\n"); */ continue; }
++				pte = pte_offset_map(pmd, addr);
++				if (pte_none(*pte)) { addr += PAGE_SIZE; /*printk("not mapped in pte\n"); */ continue; }
++				//if (pte_present(*pte)){
++				if (!pte_none(*pte)){
++					*pte = pte_wrprotect(*pte);         
++					//printk("%d pages write protected \n",i);			
++					i++;
++					addr += PAGE_SIZE;					
++				}
++			}
++			//printk("Page table of one anonymous region containing %d PTEs are write protected\n",i);
++			i=1;                                         
++		}
++	} 
++	//spin_unlock(&mm->page_table_lock);  
++	//printk("Page tables of all vma regions write protected\n");
++	mm->context_saved_status = 1;
++	return 0;
++}
++
++static int restore_context(struct mm_struct * mm)
++{
++	struct save_context *temp;
++	unsigned long restore_status;
++	program_state = mm->program_state;
++	while (program_state!=NULL){
++		buff = program_state->kvm_start;
++		user_page = program_state->uvm_start;
++		//printk("Restoring kernel buff : 0x%lx to user space : 0x%lx \n",buff,user_page); 
++		restore_status = copy_to_user((void *)user_page,(const void *)buff,PAGE_SIZE);
++		if (restore_status != 0){
++			//printk("restore not successful\n");
++			return -EFAULT;			
++		}			
++		//printk("Restored one page successfully %ld\n",restore_status);
++		vfree(buff);
++		//printk("Freed kernel page \n");
++		//free save_context * pointed by program_state
++		temp = program_state->next_copied_page;
++		vfree(program_state);
++		program_state = temp ;
++	}
++	mm->program_state = NULL;
++	mm->context_saved_status = 0;
++
++	return 0;
++}
++
++
++SYSCALL_DEFINE1(my_precious, int ,a)
++{
++	int pid = task_pid_nr(current);
++	for_each_process(task) {
++		if ( task->pid == pid) {
++			mm=task->mm;
++			if (a==0){
++				if (mm->context_saved_status == 0) {
++					//printk("Set context_saved_status in mm_struct to 1 \n");
++					return save_context(mm);
++				}
++				else {
++					//printk("Context saved previously already as context_saved_status was already 1 \n ");
++					return -EINVAL;						
++				}
++			}
++			if (a==1){
++				if ((mm->context_saved_status)==0){
++					//printk("No context to restore as context_saved_status is 0 \n");
++					return -EINVAL;
++				}				
++				else{
++					//printk("Restoring context \n");
++					return restore_context(mm);
++				}
++			}
++
++		}
++	}
++		
++	return 0;
++}
++
+-- 
+2.17.1
+
